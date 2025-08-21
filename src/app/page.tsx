@@ -1,10 +1,32 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
-// This page now has two tabs: "폭탄 해제" (defuse) and "점령전" (domination).
-// - Defuse tab = previous bomb timer with audio/vibration/flash (boom2.mp3 in /public if present).
-// - Domination tab = Red vs Blue tug-of-war bar. Press Red/Blue to move control. Switching sides first pulls back to 0, then fills the other side. You can set time-to-100%, pause, and reset.
+// This page has two tabs: "폭탄 해제" (defuse) and "점령전" (domination).
+// - Defuse tab = bomb timer with audio/vibration/flash (boom2.mp3 in /public if present).
+// - Domination tab = Red vs Blue tug-of-war bar with immediate visual updates, settable time-to-100%, pause, reset.
+// TypeScript/ESLint friendly (no `any`, proper hooks deps, escaped quotes, null-safe audio refs).
+
+// ---- AudioContext helpers (no `any`) ----
+// Some browsers expose webkitAudioContext. This helper resolves a constructor safely.
+
+type AudioContextCtor = new (
+  contextOptions?: AudioContextOptions
+) => AudioContext;
+function getAudioContextCtor(): AudioContextCtor | undefined {
+  if (typeof window === "undefined") return undefined;
+  const w = window as unknown as {
+    AudioContext?: AudioContextCtor;
+    webkitAudioContext?: AudioContextCtor;
+  };
+  return w.AudioContext ?? w.webkitAudioContext;
+}
 
 export default function BombGamePage() {
   const [tab, setTab] = useState<"defuse" | "domination">("defuse");
@@ -78,94 +100,71 @@ function DefuseTab() {
   const [disarmMode, setDisarmMode] = useState(false);
   const [pressed, setPressed] = useState<boolean[]>(Array(9).fill(false));
 
-  const intervalRef = useRef<number | NodeJS.Timeout | null>(null);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // --- Audio Core ---
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sampleBufferRef = useRef<AudioBuffer | null>(null);
 
-  function ensureAudio() {
-    try {
-      if (typeof window === "undefined") return;
-      const Ctx =
-        (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (!Ctx) return;
-      if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
-      if (audioCtxRef.current?.state === "suspended")
-        audioCtxRef.current.resume();
-    } catch {}
-  }
-  function tone(
-    freq: number,
-    duration = 0.08,
-    type: OscillatorType = "sine",
-    volume = 0.06,
-    when = 0
-  ) {
+  const ensureAudio = useCallback(() => {
+    const Ctx = getAudioContextCtor();
+    if (!Ctx) return;
+    if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
     const ctx = audioCtxRef.current;
-    if (!ctx) return;
-    const t0 = ctx.currentTime + when;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = type;
-    osc.frequency.setValueAtTime(freq, t0);
-    gain.gain.setValueAtTime(volume, t0);
-    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
-    osc.connect(gain).connect(ctx.destination);
-    osc.start(t0);
-    osc.stop(t0 + duration);
-  }
-  function playTick(secondLeft: number) {
-    const urgent = secondLeft <= 10;
-    const freq = urgent ? 1100 : 880;
-    const dur = urgent ? 0.1 : 0.06;
-    tone(freq, dur, "square", urgent ? 0.08 : 0.05);
-  }
-  function playFailBeep() {
+    if (ctx.state === "suspended") {
+      void ctx.resume();
+    }
+  }, []);
+
+  const tone = useCallback(
+    (
+      freq: number,
+      duration = 0.08,
+      type: OscillatorType = "sine",
+      volume = 0.06,
+      when = 0
+    ) => {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const t0 = ctx.currentTime + when;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t0);
+      gain.gain.setValueAtTime(volume, t0);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + duration);
+    },
+    []
+  );
+
+  const playTick = useCallback(
+    (secondLeft: number) => {
+      const urgent = secondLeft <= 10;
+      const freq = urgent ? 1100 : 880;
+      const dur = urgent ? 0.1 : 0.06;
+      tone(freq, dur, "square", urgent ? 0.08 : 0.05);
+    },
+    [tone]
+  );
+
+  const playFailBeep = useCallback(() => {
     tone(220, 0.12, "square", 0.08);
-  }
-  function playSuccess() {
+  }, [tone]);
+
+  const playSuccess = useCallback(() => {
     ensureAudio();
     tone(523.25, 0.09, "sine", 0.07, 0);
     tone(659.25, 0.09, "sine", 0.07, 0.1);
     tone(783.99, 0.12, "sine", 0.07, 0.2);
-  }
+  }, [ensureAudio, tone]);
 
-  // Try sample first, fallback to synth
-  async function playExplosion() {
+  const playExplosionSynth = useCallback(() => {
     ensureAudio();
     const ctx = audioCtxRef.current;
     if (!ctx) return;
-    if (!sampleBufferRef.current) {
-      try {
-        const res = await fetch("/boom2.mp3", { cache: "force-cache" });
-        if (res.ok) {
-          const arr = await res.arrayBuffer();
-          sampleBufferRef.current = await ctx.decodeAudioData(arr);
-        }
-      } catch {}
-    }
-    if (sampleBufferRef.current) {
-      const src = ctx.createBufferSource();
-      src.buffer = sampleBufferRef.current;
-      const gain = ctx.createGain();
-      gain.gain.value = 0.85;
-      const comp = ctx.createDynamicsCompressor();
-      comp.threshold.value = -18;
-      comp.knee.value = 20;
-      comp.ratio.value = 4;
-      comp.attack.value = 0.003;
-      comp.release.value = 0.25;
-      src.connect(gain).connect(comp).connect(ctx.destination);
-      src.start();
-      return;
-    }
-    playExplosionSynth();
-  }
-
-  function playExplosionSynth() {
-    ensureAudio();
-    const ctx = audioCtxRef.current!;
 
     const comp = ctx.createDynamicsCompressor();
     comp.threshold.value = -22;
@@ -231,14 +230,46 @@ function DefuseTab() {
         timeOffset: 0.05 + i * 0.05 + Math.random() * 0.02,
       });
     }
-  }
+  }, [ensureAudio]);
 
-  function vibrate(pattern: number | number[]) {
-    try {
-      if (typeof navigator !== "undefined" && (navigator as any).vibrate)
-        (navigator as any).vibrate(pattern);
-    } catch {}
-  }
+  const playExplosion = useCallback(async () => {
+    ensureAudio();
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    if (!sampleBufferRef.current) {
+      try {
+        const res = await fetch("/boom2.mp3", { cache: "force-cache" });
+        if (res.ok) {
+          const arr = await res.arrayBuffer();
+          sampleBufferRef.current = await ctx.decodeAudioData(arr);
+        }
+      } catch {
+        // ignore and fallback to synth
+      }
+    }
+    if (sampleBufferRef.current) {
+      const src = ctx.createBufferSource();
+      src.buffer = sampleBufferRef.current;
+      const gain = ctx.createGain();
+      gain.gain.value = 0.85;
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -18;
+      comp.knee.value = 20;
+      comp.ratio.value = 4;
+      comp.attack.value = 0.003;
+      comp.release.value = 0.25;
+      src.connect(gain).connect(comp).connect(ctx.destination);
+      src.start();
+      return;
+    }
+    playExplosionSynth();
+  }, [ensureAudio, playExplosionSynth]);
+
+  const vibrate = useCallback((pattern: number | number[]) => {
+    if (typeof navigator !== "undefined") {
+      navigator.vibrate?.(pattern);
+    }
+  }, []);
 
   const formatted = useMemo(() => formatTime(timeLeft), [timeLeft]);
   const isLow = isRunning && timeLeft > 0 && timeLeft <= 10;
@@ -256,7 +287,7 @@ function DefuseTab() {
           setIsRunning(false);
           setDisarmMode(false);
           setShowExploded(true);
-          playExplosion();
+          void playExplosion();
           vibrate([200, 120, 200]);
           return 0;
         }
@@ -265,14 +296,14 @@ function DefuseTab() {
         if (next <= 5) vibrate(30);
         return next;
       });
-    }, 1000) as any;
+    }, 1000);
 
     return clearTick;
-  }, [isRunning]);
+  }, [isRunning, playExplosion, playTick, vibrate]);
 
   function clearTick() {
     if (intervalRef.current) {
-      clearInterval(intervalRef.current as any);
+      clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
   }
@@ -399,7 +430,7 @@ function DefuseTab() {
           <div id="disarm-panel" className="mt-6">
             <div className="flex items-center justify-between mb-3">
               <div className="text-sm text-neutral-300">
-                버튼을 모두 누른 뒤 다시 "해제"를 누르세요.
+                버튼을 모두 누른 뒤 다시 &quot;해제&quot;를 누르세요.
               </div>
               <div className="text-sm">진행도: {pressedCount}/9</div>
             </div>
@@ -581,7 +612,7 @@ function DominationTab() {
     fillTimeRef.current = fillTimeSec;
   }, [fillTimeSec]);
 
-  // Always-on interval ticker (robust against StrictMode)
+  // Always-on interval ticker
   useEffect(() => {
     const intervalMs = 50; // 20 FPS
     const id = setInterval(() => {
@@ -622,7 +653,6 @@ function DominationTab() {
   const setActiveAndKick = (side: "red" | "blue" | null) => {
     setActive(side);
     if (side) {
-      // ensure immediate visible movement without waiting next tick
       const kickDt = 0.06; // 60ms worth of progress instantly
       const stepPerSec = 100 / Math.max(1, fillTimeRef.current);
       const dir = side === "red" ? 1 : -1;
